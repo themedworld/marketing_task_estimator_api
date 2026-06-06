@@ -12,7 +12,7 @@ import os
 # =====================================
 
 MODEL_PATH = "./best_duration_model.joblib"
-MLB_PATH   = "./mlb_channels.joblib"        # ✅ ajouté
+MLB_PATH   = "./mlb_channels.joblib"
 
 # =====================================
 # APP
@@ -39,9 +39,10 @@ if not os.path.exists(MLB_PATH):
     raise FileNotFoundError(f"MLB not found: {MLB_PATH}")
 
 model = joblib.load(MODEL_PATH)
-mlb   = joblib.load(MLB_PATH)               # ✅ ajouté
+mlb   = joblib.load(MLB_PATH)
 
 print("Model loaded successfully")
+print(f"MLB classes: {mlb.classes_}")
 
 # =====================================
 # INPUT SCHEMA
@@ -69,78 +70,93 @@ def health():
 @app.post("/predict")
 def predict(input_data: PredictInput):
     try:
-        single_example = input_data.data
+        d = input_data.data
 
         print(
-            f"[predict] task_type={single_example.get('task_type')} "
-            f"status={single_example.get('status')} "
-            f"priority={single_example.get('priority')} "
-            f"channel_group={single_example.get('channel_group')}"
+            f"[predict] task_type={d.get('task_type')} "
+            f"status={d.get('status')} "
+            f"priority={d.get('priority')} "
+            f"channel_group={d.get('channel_group')}"
         )
 
-        # =========================
-        # Expected columns
-        # =========================
+        # =====================================================
+        # MAPPING : frontend keys → colonnes d'entraînement
+        # Le modèle a été entraîné sur ces colonnes exactes
+        # =====================================================
 
-        expected_cols = [
-            'task_type', 'status', 'priority',
-            'cost', 'impressions', 'clicks', 'conversions', 'leads',
-            'score', 'ctr', 'channel_group', 'complexity', 'effort',
-            'unused1', 'flag', 'id',
-            'ch_App', 'ch_Bing', 'ch_Creative', 'ch_Display', 'ch_Email',
-            'ch_Facebook', 'ch_Google', 'ch_Instagram', 'ch_Internal',
-            'ch_LinkedIn', 'ch_Multi', 'ch_Native', 'ch_Pinterest',
-            'ch_Programmatic', 'ch_Push', 'ch_SMS', 'ch_Snapchat',
-            'ch_Social', 'ch_Spotify', 'ch_TV', 'ch_TikTok', 'ch_Twitter',
-            'ch_Website', 'ch_YouTube',
-        ]
+        # Colonnes catégorielles (OneHotEncoded par le pipeline)
+        task_type     = str(d.get('task_type',     'OTHER'))
+        status        = str(d.get('status',        'TO_DO'))
+        priority      = str(d.get('priority',      'MEDIUM'))
+        channel_group = str(d.get('channel_group', 'Social'))
 
-        # =========================
-        # DataFrame
-        # =========================
+        # Colonnes numériques
+        cost        = float(d.get('cost',        0) or 0)
+        impressions = float(d.get('impressions', 0) or 0)
+        clicks      = float(d.get('clicks',      0) or 0)
+        conversions = float(d.get('conversions', 0) or 0)
+        leads       = float(d.get('leads',       0) or 0)
+        score       = float(d.get('score',       3) or 3)
+        ctr         = float(d.get('ctr',         0) or 0)
+        complexity  = float(d.get('complexity',  3) or 3)
+        effort      = float(d.get('effort',      2) or 2)
+        unused1     = float(d.get('unused1',     0) or 0)
+        flag        = float(d.get('flag',        0) or 0)
+        id_val      = float(d.get('id',          0) or 0)
 
-        raw = pd.DataFrame([single_example]).copy()
+        # =====================================================
+        # Channels → one-hot via mlb
+        # =====================================================
 
-        # Ajouter colonnes manquantes
-        for c in expected_cols:
-            if c not in raw.columns:
-                raw[c] = np.nan
+        channels_str  = str(d.get('channels', '') or '')
+        channels_list = [[s.strip() for s in channels_str.split(';') if s.strip()]]
 
-        # =========================
-        # ✅ Handle channels via mlb (même logique que l'entraînement)
-        # =========================
+        ch_matrix = mlb.transform(channels_list)
+        ch_cols   = {f"ch_{c}": int(ch_matrix[0][i]) for i, c in enumerate(mlb.classes_)}
 
-        channels_str = str(single_example.get("channels", ""))
-        channels_list = [[s.strip() for s in channels_str.split(";") if s.strip()]]
+        # =====================================================
+        # Construire le DataFrame avec l'ordre exact
+        # =====================================================
 
-        ch_df = pd.DataFrame(
-            mlb.transform(channels_list),
-            columns=[f"ch_{c}" for c in mlb.classes_],
-        )
+        row = {
+            'task_type':     task_type,
+            'status':        status,
+            'priority':      priority,
+            'cost':          cost,
+            'impressions':   impressions,
+            'clicks':        clicks,
+            'conversions':   conversions,
+            'leads':         leads,
+            'score':         score,
+            'ctr':           ctr,
+            'channel_group': channel_group,
+            'complexity':    complexity,
+            'effort':        effort,
+            'unused1':       unused1,
+            'flag':          flag,
+            'id':            id_val,
+            **ch_cols,
+        }
 
-        for col in ch_df.columns:
-            raw[col] = ch_df[col].values[0]
+        raw = pd.DataFrame([row])
 
-        # Supprimer la colonne channels brute
-        if "channels" in raw.columns:
-            raw = raw.drop(columns=["channels"])
+        print(f"[predict] shape: {raw.shape}, colonnes: {raw.columns.tolist()}")
 
-        # Réordonner
-        raw = raw[expected_cols]
-
-        # =========================
-        # Prediction
-        # =========================
+        # =====================================================
+        # Prédiction
+        # =====================================================
 
         prediction = model.predict(raw)
 
-        if hasattr(prediction, "ndim") and prediction.ndim > 1:
+        if hasattr(prediction, 'ndim') and prediction.ndim > 1:
             prediction = prediction.ravel()
 
-        result = float(prediction[0])
-        print(f"[predict] résultat: {result:.2f}h")
+        # La target d'entraînement est actualDurationHours → déjà en heures
+        result_hours = round(float(prediction[0]), 2)
 
-        return {"prediction": result}
+        print(f"[predict] résultat: {result_hours:.2f}h")
+
+        return {"prediction": result_hours}
 
     except Exception as e:
         print(f"[predict] erreur: {e}")
